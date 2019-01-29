@@ -6,8 +6,36 @@ from baselines.common.input import observation_placeholder, encode_observation
 from baselines.common.tf_util import adjust_shape
 from baselines.common.mpi_running_mean_std import RunningMeanStd
 from baselines.common.models import get_network_builder
+from baselines.broadcast_fc import broadcast_fc
 
 import gym
+
+
+def is_tensor_none(tensordim):
+    assert isinstance(tensordim, tf.Dimension)
+    return tensordim.is_compatible_with(2) and tensordim.is_compatible_with(3)
+
+
+def attn_block_to_scalar(tensor, mask, scope):
+    with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+        values = broadcast_fc(tensor, 'values', 1, use_bias=True) # dim (batch, N, 1)
+
+        tf.summary.histogram('per_action_value', values, family='value_fn')
+
+        logits = broadcast_fc(tensor, 'value_fn_logits', 1, use_bias=False) # dim (batch, N, 1)
+
+        logits += mask # dim (batch, N, 1)
+
+        size = tf.size(logits)
+        softmax = lambda: tf.nn.softmax(logits, axis=-2)
+        weights = tf.cond(size > 0, softmax, lambda: logits,
+                          name='value_fn_weights')
+        tf.summary.histogram('per_action_value_attn_weights', weights, family='value_fn')
+
+        scalar_value = tf.matmul(weights, values, transpose_a=True) # dim (batch, 1, 1)
+        tf.summary.histogram('vf_pred', scalar_value, family='value_fn')
+        scalar_squeeze = tf.squeeze(scalar_value, -1) # dim now (batch, 1)
+        return scalar_squeeze
 
 
 class PolicyWithValue(object):
@@ -37,11 +65,13 @@ class PolicyWithValue(object):
         self.state = tf.constant([])
         self.initial_state = None
         self.__dict__.update(tensors)
+        self.latent = latent
 
         vf_latent = vf_latent if vf_latent is not None else latent
 
-        vf_latent = tf.layers.flatten(vf_latent)
-        latent = tf.layers.flatten(latent)
+        if not is_tensor_none(latent.shape[1]):
+            vf_latent = tf.layers.flatten(vf_latent)
+            latent = tf.layers.flatten(latent)
 
         # Based on the action space, will select what probability distribution type
         self.pdtype = make_pdtype(env.action_space)
@@ -52,7 +82,11 @@ class PolicyWithValue(object):
         self.action = self.pd.sample()
 
         # Calculate the neg log of our probability
-        self.neglogp = self.pd.neglogp(self.action)
+        if 'nonpad_vehicles_float' in tensors:
+            self.neglogp = self.pd.neglogp(self.action,
+                                           tensors['nonpad_vehicles_float'])
+        else:
+            self.neglogp = self.pd.neglogp(self.action)
         self.sess = sess or tf.get_default_session()
 
         if estimate_q:
@@ -60,7 +94,10 @@ class PolicyWithValue(object):
             self.q = fc(vf_latent, 'q', env.action_space.n)
             self.vf = self.q
         else:
-            self.vf = fc(vf_latent, 'vf', 1)
+            if is_tensor_none(vf_latent.shape[-2]) and 'mask' in tensors:
+                self.vf = attn_block_to_scalar(vf_latent, tensors['mask'], 'vf')
+            else:
+                self.vf = fc(vf_latent, 'vf', 1)
             self.vf = self.vf[:,0]
 
     def _evaluate(self, variables, observation, **extra_feed):
@@ -145,9 +182,13 @@ def build_policy(env, policy_network, value_network=None,  normalize_observation
 
                 if recurrent_tensors is not None:
                     # recurrent architecture, need a few more steps
-                    nenv = nbatch // nsteps
-                    assert nenv > 0, 'Bad input for recurrent policy: batch size {} smaller than nsteps {}'.format(nbatch, nsteps)
-                    policy_latent, recurrent_tensors = policy_network(encoded_x, nenv)
+                    # skipping this so that recurrent_tensors can be subbed
+                    # for the mask of tensors to ignore when computing the value
+                    # function
+
+                    # nenv = nbatch // nsteps
+                    # assert nenv > 0, 'Bad input for recurrent policy: batch size {} smaller than nsteps {}'.format(nbatch, nsteps)
+                    # policy_latent, recurrent_tensors = policy_network(encoded_x, nenv)
                     extra_tensors.update(recurrent_tensors)
 
 
@@ -183,4 +224,3 @@ def _normalize_clip_observation(x, clip_range=[-5.0, 5.0]):
     rms = RunningMeanStd(shape=x.shape[1:])
     norm_x = tf.clip_by_value((x - rms.mean) / rms.std, min(clip_range), max(clip_range))
     return norm_x, rms
-

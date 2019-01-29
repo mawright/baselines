@@ -388,8 +388,10 @@ def adjust_shape(placeholder, data):
 
     assert _check_shape(placeholder_shape, data.shape), \
         'Shape of data {} is not compatible with shape of the placeholder {}'.format(data.shape, placeholder_shape)
-
-    return np.reshape(data, placeholder_shape)
+    try:
+        return np.reshape(data, placeholder_shape)
+    except ValueError:
+        return data
 
 
 def _check_shape(placeholder_shape, data_shape):

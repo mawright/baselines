@@ -1,5 +1,7 @@
 import numpy as np
 from baselines.common.runners import AbstractEnvRunner
+from baselines.common.vec_env.subproc_vec_env import pad_batch_elements
+from itertools import chain
 
 class Runner(AbstractEnvRunner):
     """
@@ -10,36 +12,69 @@ class Runner(AbstractEnvRunner):
     run():
     - Make a mini batch
     """
-    def __init__(self, *, env, model, nsteps, gamma, lam):
+    def __init__(self, *, env, model, nsteps, gamma, lam, nreps=1):
         super().__init__(env=env, model=model, nsteps=nsteps)
         # Lambda used in GAE (General Advantage Estimation)
         self.lam = lam
         # Discount rate
         self.gamma = gamma
+        self.nreps = nreps
 
     def run(self):
         # Here, we init the lists that will contain the mb of experiences
         mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [],[],[],[],[],[]
+        last_values = []
+        last_dones = []
         mb_states = self.states
         epinfos = []
-        # For n in range number of steps
-        for _ in range(self.nsteps):
-            # Given observations, get action value and neglopacs
-            # We already have self.obs because Runner superclass run self.obs[:] = env.reset() on init
-            actions, values, self.states, neglogpacs = self.model.step(self.obs, S=self.states, M=self.dones)
-            mb_obs.append(self.obs.copy())
-            mb_actions.append(actions)
-            mb_values.append(values)
-            mb_neglogpacs.append(neglogpacs)
-            mb_dones.append(self.dones)
+        for rep in range(self.nreps):
+            # self.obs[:] = self.env.reset()
+            # self.dones = [False for _ in range(self.nenv)]
+            mmb_obs, mmb_rewards, mmb_actions, mmb_values, mmb_dones, mmb_neglogpacs = [],[],[],[],[],[]
+            # For n in range number of steps
+            for step in range(self.nsteps):
+                # Given observations, get action value and neglopacs
+                # We already have self.obs because Runner superclass run self.obs[:] = env.reset() on init
+                actions, values, self.states, neglogpacs = self.model.step(self.obs, S=self.states, M=self.dones)
+                mmb_obs.append(self.obs.copy())
+                mmb_actions.append(actions)
+                mmb_values.append(values)
+                mmb_neglogpacs.append(neglogpacs)
+                mmb_dones.append(self.dones)
 
-            # Take actions in env and look the results
-            # Infos contains a ton of useful informations
-            self.obs[:], rewards, self.dones, infos = self.env.step(actions)
-            for info in infos:
-                maybeepinfo = info.get('episode')
-                if maybeepinfo: epinfos.append(maybeepinfo)
-            mb_rewards.append(rewards)
+                # Take actions in env and look the results
+                # Infos contains a ton of useful informations
+                obs, rewards, self.dones, infos = self.env.step(actions)
+                if np.size(obs) == np.size(self.obs):
+                    self.obs[:] = obs
+                else:
+                    self.obs = obs
+
+                for info in infos:
+                    maybeepinfo = info.get('episode')
+                    if maybeepinfo: epinfos.append(maybeepinfo)
+                mmb_rewards.append(rewards)
+                if any(self.dones):
+                    print(f'step {step}: {np.sum(self.dones)} done')
+            # append this batch of rollouts
+            mb_obs.append(mmb_obs)
+            mb_rewards.append(mmb_rewards)
+            mb_actions.append(mmb_actions)
+            mb_values.append(mmb_values)
+            mb_dones.append(mmb_dones)
+            mb_neglogpacs.append(mmb_dones)
+            last_values.append(self.model.value(self.obs, S=self.states, M=self.dones))
+            last_dones.append(self.dones)
+
+        # concat all rollouts together
+        mb_obs, mb_rewards, mb_actions, mb_values, mb_neglogpacs, mb_dones = map(
+            pad_concat, [mb_obs, mb_rewards, mb_actions, mb_values, mb_neglogpacs, mb_dones]
+        )
+
+        # have to zero-pad all obs and actions
+        mb_obs = tuple(pad_batch_elements(mb_obs))
+        mb_actions = tuple(pad_batch_elements(mb_actions))
+
         #batch of steps to batch of rollouts
         mb_obs = np.asarray(mb_obs, dtype=self.obs.dtype)
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
@@ -47,7 +82,9 @@ class Runner(AbstractEnvRunner):
         mb_values = np.asarray(mb_values, dtype=np.float32)
         mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
-        last_values = self.model.value(self.obs, S=self.states, M=self.dones)
+
+        last_values = np.concatenate(last_values, 0)
+        last_dones = np.concatenate(last_dones, 0)
 
         # discount/bootstrap off value fn
         mb_returns = np.zeros_like(mb_rewards)
@@ -55,7 +92,7 @@ class Runner(AbstractEnvRunner):
         lastgaelam = 0
         for t in reversed(range(self.nsteps)):
             if t == self.nsteps - 1:
-                nextnonterminal = 1.0 - self.dones
+                nextnonterminal = 1.0 - last_dones
                 nextvalues = last_values
             else:
                 nextnonterminal = 1.0 - mb_dones[t+1]
@@ -74,3 +111,12 @@ def sf01(arr):
     return arr.swapaxes(0, 1).reshape(s[0] * s[1], *s[2:])
 
 
+def pad_concat(batchlist):
+    # max_dim = np.max(np.array([np.shape(item) for item in chain(batchlist)]))
+    # def _pad(item):
+    #     pad_after = max_dim - np.shape(item)
+    #     pad_width = list(zip(__zero, pad_after))
+    #     return np.pad(item, pad_width, 'constant', constant_values=0)
+    # batchlist = [pad_batch_elements(b) for b in batchlist]
+    return [np.concatenate(tuple(pad_batch_elements(step)), 0)
+            for step in zip(*batchlist)]

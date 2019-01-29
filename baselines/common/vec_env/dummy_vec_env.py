@@ -22,7 +22,11 @@ class DummyVecEnv(VecEnv):
         obs_space = env.observation_space
         self.keys, shapes, dtypes = obs_space_info(obs_space)
 
-        self.buf_obs = { k: np.zeros((self.num_envs,) + tuple(shapes[k]), dtype=dtypes[k]) for k in self.keys }
+        for k, shape in shapes.items():
+            shapes[k] = tuple(s if s is not None else 0 for s in shape)
+
+        self.buf_obs = { k: [np.zeros(tuple(shapes[k]), dtype=dtypes[k])
+                             for e in range(self.num_envs)] for k in self.keys }
         self.buf_dones = np.zeros((self.num_envs,), dtype=np.bool)
         self.buf_rews  = np.zeros((self.num_envs,), dtype=np.float32)
         self.buf_infos = [{} for _ in range(self.num_envs)]

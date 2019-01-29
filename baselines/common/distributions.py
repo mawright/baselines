@@ -4,6 +4,9 @@ import baselines.common.tf_util as U
 from baselines.a2c.utils import fc
 from tensorflow.python.ops import math_ops
 
+from flow.envs.multi_merge import NoneBox
+from baselines.broadcast_fc import broadcast_fc
+
 class Pd(object):
     """
     A particular probability distribution
@@ -110,6 +113,28 @@ class DiagGaussianPdType(PdType):
         return [self.size]
     def sample_dtype(self):
         return tf.float32
+
+class BroadcastedDiagGaussianPdType(DiagGaussianPdType):
+    def pdfromlatent(self, latent_tensor, init_scale=1.0, init_bias=0.0):
+        if len(latent_tensor.shape) == 2:
+            return super().pdfromlatent(latent_tensor, init_scale, init_bias)
+        assert len(latent_tensor.shape) == 3
+        mean = broadcast_fc(
+            latent_tensor,
+            'pi',
+            self.size,
+            init_scale=init_scale,
+            init_bias=init_bias) # dim (None, None, size)
+        logstd = tf.get_variable(name='pi/logstd', shape=[1, 1, self.size],
+                                 initializer=tf.zeros_initializer())
+        pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=-1)
+        return self.pdfromflat(pdparam), mean
+
+    def pdclass(self):
+        return BroadcastedDiagGaussianPd
+
+    def sample_shape(self):
+        return [None]
 
 class BernoulliPdType(PdType):
     def __init__(self, size):
@@ -249,6 +274,28 @@ class DiagGaussianPd(Pd):
         return cls(flat)
 
 
+class BroadcastedDiagGaussianPd(DiagGaussianPd):
+    def __init__(self, flat):
+        super().__init__(flat)
+        if len(flat.shape) == 3:
+            assert self.mean.shape[-1] == 1 and self.logstd.shape[-1] == 1
+            self.mean = tf.squeeze(self.mean, -1)
+            self.logstd = tf.squeeze(self.logstd, -1)
+            self.std = tf.squeeze(self.std, -1)
+    def neglogp(self, x, weights=None):
+        if weights is None:
+            return super().neglogp(x)
+        weights = tf.reshape(weights, tf.shape(x))
+        return 0.5 * tf.reduce_sum(tf.square((x - self.mean) / self.std) * weights, axis=-1) \
+                + 0.5 * np.log(2.0 * np.pi) * tf.reduce_sum(weights, axis=-1) \
+                + tf.reduce_sum(self.logstd, axis=-1)
+    def entropy(self, weights=None):
+        if weights is None:
+            return super().entropy()
+        weights = tf.reshape(weights, tf.shape(self.logstd))
+        summand = self.logstd + .5 * np.log(2.0 * np.pi * np.e)
+        return tf.reduce_sum(weights * summand, axis=-1)
+
 class BernoulliPd(Pd):
     def __init__(self, logits):
         self.logits = logits
@@ -275,8 +322,12 @@ class BernoulliPd(Pd):
 
 def make_pdtype(ac_space):
     from gym import spaces
-    if isinstance(ac_space, spaces.Box):
-        assert len(ac_space.shape) == 1
+    if isinstance(ac_space, NoneBox):
+        if len(ac_space.shape) == 1 and ac_space.shape[0] is None:
+            return BroadcastedDiagGaussianPdType(1)
+        else:
+            return BroadcastedDiagGaussianPdType(ac_space.shape[-1])
+    elif isinstance(ac_space, spaces.Box):
         return DiagGaussianPdType(ac_space.shape[0])
     elif isinstance(ac_space, spaces.Discrete):
         return CategoricalPdType(ac_space.n)
@@ -347,7 +398,7 @@ def validate_probtype(probtype, pdparam):
 
 
 def _matching_fc(tensor, name, size, init_scale, init_bias):
-    if tensor.shape[-1] == size:
+    if tensor.shape[-1].is_compatible_with(size):
         return tensor
     else:
         return fc(tensor, name, size, init_scale=init_scale, init_bias=init_bias)

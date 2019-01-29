@@ -1,6 +1,8 @@
 import numpy as np
 from multiprocessing import Process, Pipe
 from . import VecEnv, CloudpickleWrapper
+from itertools import repeat
+from collections import Iterable
 
 def worker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
@@ -108,7 +110,27 @@ def _flatten_obs(obs):
         import collections
         assert isinstance(obs, collections.OrderedDict)
         keys = obs[0].keys()
-        return {k: np.stack([o[k] for o in obs]) for k in keys}
+        return {k: _pad_stack([o[k] for o in obs]) for k in keys}
     else:
-        return np.stack(obs)
+        return _pad_stack(obs)
 
+__zero = repeat(0)
+
+def _pad_stack(obs):
+    padded = np.stack(pad_batch_elements(obs))
+    # print('padded = {}'.format(padded))
+    return padded
+
+
+def pad_batch_elements(batch_iterable):
+    """Pad each numpy array to the maximum size so that they can be stacked."""
+    assert isinstance(batch_iterable, Iterable)
+    max_dim = np.max(np.array([np.shape(item) for item in batch_iterable]),
+                     axis=0)
+
+    def _pad(item):
+        pad_after = max_dim - np.shape(item)
+        pad_width = list(zip(__zero, pad_after))
+        return np.pad(item, pad_width, 'constant', constant_values=0)
+
+    return map(_pad, batch_iterable)

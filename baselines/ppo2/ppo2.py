@@ -1,6 +1,7 @@
 import os
 import time
 import numpy as np
+import tensorflow as tf
 import os.path as osp
 from baselines import logger
 from collections import deque
@@ -18,10 +19,24 @@ def constfn(val):
         return val
     return f
 
+# TODO
+# write the netowrk architecture function (takes in obs tensor, spits out the output tensor)
+# baselines/common/distributions.py has diaggaussian
+# has to be of output size (None, None, 1)
+#
+# change obs space to be a dict with entry 2 the number of cars
+#
+# use cmd_util.py's make_vec_env
+#
+
 def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2048, ent_coef=0.0, lr=3e-4,
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95,
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, load_path=None, model_fn=None, **network_kwargs):
+            save_interval=0, load_path=None, model_fn=None,
+            nreps=1,
+            normalize_advantages=True,
+            vf_cliprange=None,
+            **network_kwargs):
     '''
     Learn policy using PPO algorithm (https://arxiv.org/abs/1707.06347)
 
@@ -95,8 +110,9 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
     ac_space = env.action_space
 
     # Calculate the batch_size
-    nbatch = nenvs * nsteps
-    nbatch_train = nbatch // nminibatches
+    nbatch = nenvs * nsteps # hardcoded, collects nenvs * nsteps o, a, r tuples
+    nbatch *= nreps
+    nbatch_train = nbatch // nminibatches # batch size per train op run
 
     # Instantiate the model object (that creates act_model and train_model)
     if model_fn is None:
@@ -104,26 +120,32 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
         model_fn = Model
 
     model = model_fn(policy=policy, ob_space=ob_space, ac_space=ac_space, nbatch_act=nenvs, nbatch_train=nbatch_train,
-                    nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-                    max_grad_norm=max_grad_norm)
+                     nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
+                     max_grad_norm=max_grad_norm)
 
     if load_path is not None:
         model.load(load_path)
     # Instantiate the runner object
-    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam)
+    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam, nreps=nreps)
     if eval_env is not None:
         eval_runner = Runner(env = eval_env, model = model, nsteps = nsteps, gamma = gamma, lam= lam)
 
-    epinfobuf = deque(maxlen=100)
+    if nsteps < 750:
+        epinfobuf = deque(maxlen=100)
+    else:
+        epinfobuf = None
     if eval_env is not None:
         eval_epinfobuf = deque(maxlen=100)
 
     # Start total timer
     tfirststart = time.time()
 
+    summary_op = tf.summary.merge_all()
+    tb_writer = tf.summary.FileWriter(os.path.join(logger.get_dir(), 'tb2'), model.sess.graph)
+
     nupdates = total_timesteps//nbatch
     for update in range(1, nupdates+1):
-        assert nbatch % nminibatches == 0
+        # assert nbatch % nminibatches == 0
         # Start timer
         tstart = time.time()
         frac = 1.0 - (update - 1.0) / nupdates
@@ -136,7 +158,10 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
         if eval_env is not None:
             eval_obs, eval_returns, eval_masks, eval_actions, eval_values, eval_neglogpacs, eval_states, eval_epinfos = eval_runner.run() #pylint: disable=E0632
 
-        epinfobuf.extend(epinfos)
+        if isinstance(epinfobuf, deque):
+            epinfobuf.extend(epinfos)
+        else:
+            epinfobuf = epinfos
         if eval_env is not None:
             eval_epinfobuf.extend(eval_epinfos)
 
@@ -146,6 +171,12 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
             # Index of each element of batch_size
             # Create the indices array
             inds = np.arange(nbatch)
+            np.random.shuffle(inds)
+            sum_inds = inds[0:10000]
+            slices = (arr[sum_inds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+            summary = model.summary_op(lrnow, cliprangenow, *slices, summary_op=summary_op,
+                                       vf_cliprange=vf_cliprange,
+                                       normalize_advantages=normalize_advantages)
             for _ in range(noptepochs):
                 # Randomize the indexes
                 np.random.shuffle(inds)
@@ -154,7 +185,9 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
                     end = start + nbatch_train
                     mbinds = inds[start:end]
                     slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices))
+                    mblossvals.append(model.train(lrnow, cliprangenow, *slices,
+                                                  vf_cliprange=vf_cliprange,
+                                                  normalize_advantages=normalize_advantages))
         else: # recurrent version
             assert nenvs % nminibatches == 0
             envsperbatch = nenvs // nminibatches
@@ -180,14 +213,24 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
         if update % log_interval == 0 or update == 1:
             # Calculates if value function is a good predicator of the returns (ev > 1)
             # or if it's just worse than predicting nothing (ev =< 0)
-            ev = explained_variance(values, returns)
+            nondummy_iterations = np.logical_not(np.array([np.all(o == 0) for o in obs]))
+            ev = explained_variance(values[nondummy_iterations], returns[nondummy_iterations])
+            ev_all = explained_variance(values, returns)
             logger.logkv("serial_timesteps", update*nsteps)
             logger.logkv("nupdates", update)
             logger.logkv("total_timesteps", update*nbatch)
             logger.logkv("fps", fps)
             logger.logkv("explained_variance", float(ev))
+            logger.logkv("explained_variance_all", float(ev_all))
+            logger.logkv("num_episodes", len(epinfobuf))
             logger.logkv('eprewmean', safemean([epinfo['r'] for epinfo in epinfobuf]))
             logger.logkv('eplenmean', safemean([epinfo['l'] for epinfo in epinfobuf]))
+            logger.logkv('eprewmax', safemax([epinfo['r'] for epinfo in epinfobuf]))
+            logger.logkv('eplenmax', safemax([epinfo['l'] for epinfo in epinfobuf]))
+            logger.logkv('eprewstd', safestd([epinfo['r'] for epinfo in epinfobuf]))
+            logger.logkv('eplenstd', safestd([epinfo['l'] for epinfo in epinfobuf]))
+            logger.logkv('eprewmin', safemin([epinfo['r'] for epinfo in epinfobuf]))
+            logger.logkv('eplenmin', safemin([epinfo['l'] for epinfo in epinfobuf]))
             if eval_env is not None:
                 logger.logkv('eval_eprewmean', safemean([epinfo['r'] for epinfo in eval_epinfobuf]) )
                 logger.logkv('eval_eplenmean', safemean([epinfo['l'] for epinfo in eval_epinfobuf]) )
@@ -196,6 +239,9 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
                 logger.logkv(lossname, lossval)
             if MPI is None or MPI.COMM_WORLD.Get_rank() == 0:
                 logger.dumpkvs()
+
+            tb_writer.add_summary(summary, update)
+
         if save_interval and (update % save_interval == 0 or update == 1) and logger.get_dir() and (MPI is None or MPI.COMM_WORLD.Get_rank() == 0):
             checkdir = osp.join(logger.get_dir(), 'checkpoints')
             os.makedirs(checkdir, exist_ok=True)
@@ -207,5 +253,11 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
 def safemean(xs):
     return np.nan if len(xs) == 0 else np.mean(xs)
 
+def safemax(xs):
+    return np.nan if len(xs) == 0 else np.max(xs)
 
+def safestd(xs):
+    return np.nan if len(xs) == 0 else np.std(xs)
 
+def safemin(xs):
+    return np.nan if len(xs) == 0 else np.min(xs)
